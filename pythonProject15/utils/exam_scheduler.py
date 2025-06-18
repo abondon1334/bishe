@@ -1,6 +1,7 @@
 import sqlite3
 import random
 from datetime import datetime, timedelta
+from utils.teacher_constraints import TeacherConstraintsManager
 
 class ExamScheduler:
     def __init__(self, db_path='exam_system.db'):
@@ -12,15 +13,19 @@ class ExamScheduler:
         ]
         # 默认为五场考试时添加的时间段
         self.extra_time_slot = "19:00-21:00"
+        # 教师约束管理器
+        self.teacher_constraints = TeacherConstraintsManager()
 
     def schedule_exams(self, start_date=None, end_date=None, slots_per_day=4):
         """
         自动排考场算法
         根据老师平时上课教室安排考试，处理教室容量和时间冲突问题
+        增加教师约束检查和排考失败检测
         
         :param start_date: 考试开始日期，格式：YYYY-MM-DD
         :param end_date: 考试结束日期，格式：YYYY-MM-DD
         :param slots_per_day: 每天安排的考试场次数量，4或5
+        :return: (success, message, failed_courses)
         """
         try:
             # 清空原有考试安排
@@ -71,6 +76,9 @@ class ExamScheduler:
             # 格式: {(日期, 时间段, 教室编号): 已用座位数}
             room_usage = {}
             
+            # 记录教师每日考试安排数量
+            teacher_daily_count = {}
+            
             # 按教师分组课程，确保同一教师的课程尽量安排在同一教室
             teacher_courses = {}
             for course in courses:
@@ -87,6 +95,10 @@ class ExamScheduler:
             while current_date <= end_date_obj:
                 exam_dates.append(current_date.strftime("%Y-%m-%d"))
                 current_date += timedelta(days=1)
+            
+            # 记录排考失败的课程
+            failed_courses = []
+            successfully_scheduled = 0
             
             # 为每个教师的课程安排考试
             for teacher, teacher_course_list in teacher_courses.items():
@@ -120,9 +132,14 @@ class ExamScheduler:
                     # 如果考试人数超过一个合理值（如10人），则使用实际的考试教室
                     actual_students_count = max(10, students_count)
                     
+                    # 标记是否成功安排
+                    course_scheduled = False
+                    
                     # 尝试使用教师常用的教室（按使用频率排序）
-                    used_room = False
                     for preferred_room_id, _ in preferred_rooms:
+                        if course_scheduled:
+                            break
+                            
                         # 如果该教室号在room_dict中有对应信息
                         if preferred_room_id in room_dict:
                             room_info = room_dict[preferred_room_id]
@@ -137,145 +154,121 @@ class ExamScheduler:
                                 students_per_session = (actual_students_count + sessions_needed - 1) // sessions_needed
                                 
                                 # 为每场次安排教室和时间
+                                sessions_scheduled = 0
                                 for session in range(sessions_needed):
                                     # 分配学生数量
                                     session_students = min(students_per_session, actual_students_count - session * students_per_session)
                                     
                                     # 分配考试日期和时间
-                                    assigned = False
+                                    session_assigned = False
                                     
                                     for exam_date in exam_dates:
-                                        if assigned:
+                                        if session_assigned:
                                             break
                                             
+                                        # 检查教师每日考试限制
+                                        teacher_date_key = f"{teacher}_{exam_date}"
+                                        current_daily_count = teacher_daily_count.get(teacher_date_key, 0)
+                                        
+                                        # 获取教师约束
+                                        constraints = self.teacher_constraints.db_manager.get_teacher_constraints(teacher)
+                                        if current_daily_count >= constraints['max_exams_per_day']:
+                                            continue  # 该日期已达到教师考试限制
+                                            
                                         for time_slot in time_slots:
+                                            # 验证教师时间约束
+                                            is_valid, reason = self.teacher_constraints.validate_teacher_schedule(
+                                                teacher, exam_date, time_slot
+                                            )
+                                            if not is_valid:
+                                                continue
+                                            
                                             # 检查该时段该教室是否已被安排
                                             usage_key = (exam_date, time_slot, preferred_room_id)
                                             
                                             if usage_key not in room_usage:
                                                 # 安排考试
-                                                self._arrange_exam(
+                                                if self._arrange_exam(
                                                     course_id, preferred_room_id, exam_date, time_slot,
                                                     class_name, session_students, department, major, teacher_type,
                                                     teacher, course_name, session + 1, sessions_needed
-                                                )
-                                                
-                                                # 记录教室使用情况
-                                                room_usage[usage_key] = session_students
-                                                assigned = True
-                                                used_room = True
-                                                break
-                                    
-                                    # 如果所有时间段都已安排满，尝试使用同类型的其他教室
-                                    if not assigned:
-                                        # 获取当前教室的类型
-                                        _, _, _, building, floor = room_dict[preferred_room_id]
-                                        room_type = f"{building}-{floor}"
-                                        
-                                        # 查找同类型的其他教室
-                                        if room_type in room_types:
-                                            for alt_room_id in room_types[room_type]:
-                                                if alt_room_id != preferred_room_id:
-                                                    # 检查该教室容量是否满足
-                                                    alt_room_info = room_dict[alt_room_id]
-                                                    alt_room_capacity = int(alt_room_info[2])
-                                                    
-                                                    if alt_room_capacity >= session_students:
-                                                        # 为每个考试日期和时间段检查可用性
-                                                        for exam_date in exam_dates:
-                                                            if assigned:
-                                                                break
-                                                                
-                                                            for time_slot in time_slots:
-                                                                usage_key = (exam_date, time_slot, alt_room_id)
-                                                                
-                                                                if usage_key not in room_usage:
-                                                                    # 安排考试
-                                                                    self._arrange_exam(
-                                                                        course_id, alt_room_id, exam_date, time_slot,
-                                                                        class_name, session_students, department, major, teacher_type,
-                                                                        teacher, course_name, session + 1, sessions_needed
-                                                                    )
-                                                                    
-                                                                    # 记录教室使用情况
-                                                                    room_usage[usage_key] = session_students
-                                                                    assigned = True
-                                                                    used_room = True
-                                                                    break
+                                                ):
+                                                    # 记录教室使用情况
+                                                    room_usage[usage_key] = session_students
+                                                    # 更新教师每日考试计数
+                                                    teacher_daily_count[teacher_date_key] = current_daily_count + 1
+                                                    session_assigned = True
+                                                    sessions_scheduled += 1
+                                                    break
+                                
+                                # 如果所有场次都成功安排，标记课程为已安排
+                                if sessions_scheduled == sessions_needed:
+                                    course_scheduled = True
+                                    successfully_scheduled += 1
                             else:
                                 # 学生人数不超过教室容量，直接安排一场考试
-                                assigned = False
-                                
                                 for exam_date in exam_dates:
-                                    if assigned:
+                                    if course_scheduled:
                                         break
+                                    
+                                    # 检查教师每日考试限制
+                                    teacher_date_key = f"{teacher}_{exam_date}"
+                                    current_daily_count = teacher_daily_count.get(teacher_date_key, 0)
+                                    
+                                    # 获取教师约束
+                                    constraints = self.teacher_constraints.db_manager.get_teacher_constraints(teacher)
+                                    if current_daily_count >= constraints['max_exams_per_day']:
+                                        continue  # 该日期已达到教师考试限制
                                         
                                     for time_slot in time_slots:
+                                        # 验证教师时间约束
+                                        is_valid, reason = self.teacher_constraints.validate_teacher_schedule(
+                                            teacher, exam_date, time_slot
+                                        )
+                                        if not is_valid:
+                                            continue
+                                        
                                         usage_key = (exam_date, time_slot, preferred_room_id)
                                         
                                         if usage_key not in room_usage:
                                             # 安排考试
-                                            self._arrange_exam(
+                                            if self._arrange_exam(
                                                 course_id, preferred_room_id, exam_date, time_slot,
                                                 class_name, actual_students_count, department, major, teacher_type,
                                                 teacher, course_name
-                                            )
-                                            
-                                            # 记录教室使用情况
-                                            room_usage[usage_key] = actual_students_count
-                                            assigned = True
-                                            used_room = True
-                                            break
-                                
-                                # 如果所有时间段都已安排满，尝试使用同类型的其他教室
-                                if not assigned:
-                                    # 获取当前教室的类型
-                                    _, _, _, building, floor = room_dict[preferred_room_id]
-                                    room_type = f"{building}-{floor}"
-                                    
-                                    # 查找同类型的其他教室
-                                    if room_type in room_types:
-                                        for alt_room_id in room_types[room_type]:
-                                            if alt_room_id != preferred_room_id:
-                                                # 检查该教室容量是否满足
-                                                alt_room_info = room_dict[alt_room_id]
-                                                alt_room_capacity = int(alt_room_info[2])
-                                                
-                                                if alt_room_capacity >= actual_students_count:
-                                                    # 为每个考试日期和时间段检查可用性
-                                                    for exam_date in exam_dates:
-                                                        if assigned:
-                                                            break
-                                                            
-                                                        for time_slot in time_slots:
-                                                            usage_key = (exam_date, time_slot, alt_room_id)
-                                                            
-                                                            if usage_key not in room_usage:
-                                                                # 安排考试
-                                                                self._arrange_exam(
-                                                                    course_id, alt_room_id, exam_date, time_slot,
-                                                                    class_name, actual_students_count, department, major, teacher_type,
-                                                                    teacher, course_name
-                                                                )
-                                                                
-                                                                # 记录教室使用情况
-                                                                room_usage[usage_key] = actual_students_count
-                                                                assigned = True
-                                                                used_room = True
-                                                                break
-                        
-                        # 如果已成功使用教室，跳出循环
-                        if used_room:
-                            break
-                            
-                    # 如果尝试使用教师常用教室失败，随机选择一个符合条件的教室
-                    if not used_room:
-                        # 为每个可能的日期和时间段检查可用性
+                                            ):
+                                                # 记录教室使用情况
+                                                room_usage[usage_key] = actual_students_count
+                                                # 更新教师每日考试计数
+                                                teacher_daily_count[teacher_date_key] = current_daily_count + 1
+                                                course_scheduled = True
+                                                successfully_scheduled += 1
+                                                break
+                    
+                    # 如果使用常用教室失败，尝试其他教室
+                    if not course_scheduled:
+                        # 尝试所有可用教室
                         for exam_date in exam_dates:
-                            if used_room:
+                            if course_scheduled:
                                 break
+                            
+                            # 检查教师每日考试限制
+                            teacher_date_key = f"{teacher}_{exam_date}"
+                            current_daily_count = teacher_daily_count.get(teacher_date_key, 0)
+                            
+                            # 获取教师约束
+                            constraints = self.teacher_constraints.db_manager.get_teacher_constraints(teacher)
+                            if current_daily_count >= constraints['max_exams_per_day']:
+                                continue
                                 
                             for time_slot in time_slots:
+                                # 验证教师时间约束
+                                is_valid, reason = self.teacher_constraints.validate_teacher_schedule(
+                                    teacher, exam_date, time_slot
+                                )
+                                if not is_valid:
+                                    continue
+                                
                                 # 查找所有容量符合要求的教室
                                 suitable_rooms = [room for room in rooms if int(room[2]) >= actual_students_count]
                                 
@@ -288,31 +281,86 @@ class ExamScheduler:
                                     
                                     if usage_key not in room_usage:
                                         # 安排考试
-                                        self._arrange_exam(
+                                        if self._arrange_exam(
                                             course_id, room_id, exam_date, time_slot,
                                             class_name, actual_students_count, department, major, teacher_type,
                                             teacher, course_name
-                                        )
-                                        
-                                        # 记录教室使用情况
-                                        room_usage[usage_key] = actual_students_count
-                                        used_room = True
-                                        break
+                                        ):
+                                            # 记录教室使用情况
+                                            room_usage[usage_key] = actual_students_count
+                                            # 更新教师每日考试计数
+                                            teacher_daily_count[teacher_date_key] = current_daily_count + 1
+                                            course_scheduled = True
+                                            successfully_scheduled += 1
+                                            break
                                 
-                                if used_room:
+                                if course_scheduled:
                                     break
+                    
+                    # 如果课程仍未安排，记录为失败
+                    if not course_scheduled:
+                        failed_courses.append({
+                            'course_id': course_id,
+                            'course_name': course_name,
+                            'teacher': teacher,
+                            'class_name': class_name,
+                            'students_count': actual_students_count,
+                            'reason': '无法找到合适的时间和教室'
+                        })
             
-            # 打印统计信息
-            print(f"成功安排 {len(room_usage)} 场考试")
-            self.conn.commit()
-            return True
+            # 生成排考结果报告
+            total_courses = len(courses)
+            success_rate = (successfully_scheduled / total_courses * 100) if total_courses > 0 else 0
+            
+            if failed_courses:
+                # 有课程排考失败
+                failure_message = self._generate_failure_report(failed_courses, exam_dates, slots_per_day)
+                self.conn.commit()
+                return False, failure_message, failed_courses
+            else:
+                # 所有课程都成功安排
+                success_message = f"排考成功！共安排 {successfully_scheduled} 门课程的考试，成功率 {success_rate:.1f}%"
+                print(success_message)
+                self.conn.commit()
+                return True, success_message, []
 
         except Exception as e:
             print(f"自动排考场出错: {e}")
             import traceback
             traceback.print_exc()
             self.conn.rollback()
-            return False
+            return False, f"排考过程中出现错误: {e}", []
+
+    def _generate_failure_report(self, failed_courses, exam_dates, slots_per_day):
+        """
+        生成排考失败报告
+        """
+        total_failed = len(failed_courses)
+        
+        # 计算总可用时间段
+        total_slots = len(exam_dates) * slots_per_day
+        
+        report = f"排考未完全成功！\n\n"
+        report += f"失败课程数量: {total_failed}\n"
+        report += f"考试日期范围: {exam_dates[0]} 至 {exam_dates[-1]} ({len(exam_dates)} 天)\n"
+        report += f"每日考试场次: {slots_per_day}\n"
+        report += f"总可用时间段: {total_slots}\n\n"
+        
+        report += "失败课程详情:\n"
+        for i, course in enumerate(failed_courses[:10], 1):  # 只显示前10个
+            report += f"{i}. {course['course_name']} - {course['teacher']} ({course['class_name']}, {course['students_count']}人)\n"
+        
+        if total_failed > 10:
+            report += f"... 还有 {total_failed - 10} 门课程未能安排\n"
+        
+        report += "\n建议解决方案:\n"
+        report += "1. 延长考试周期（增加考试日期）\n"
+        report += "2. 增加每日考试场次（如果教师接受晚上考试）\n"
+        report += "3. 调整教师时间约束设置\n"
+        report += "4. 增加教室资源\n"
+        report += "5. 手动调整部分课程安排\n"
+        
+        return report
 
     def _arrange_exam(self, course_id, room_id, exam_date, exam_time, class_name, 
                      students_count, department, major, teacher_type, teacher, course_name, 

@@ -5,6 +5,7 @@ import os
 import pandas as pd
 from datetime import datetime
 
+
 class DatabaseManager:
     def __init__(self, db_path='exam_system.db'):
         self.conn = sqlite3.connect(db_path)
@@ -13,7 +14,7 @@ class DatabaseManager:
 
     def create_tables(self):
         # 只创建表，不删除已有数据
-        
+
         # 课程表
         self.cursor.execute('''
         CREATE TABLE IF NOT EXISTS courses (
@@ -69,6 +70,22 @@ class DatabaseManager:
             password TEXT NOT NULL,
             role TEXT NOT NULL,
             name TEXT
+        )
+        ''')
+
+        # 教师约束表 - 新增
+        self.cursor.execute('''
+        CREATE TABLE IF NOT EXISTS teacher_constraints (
+            constraint_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            teacher_name TEXT NOT NULL,
+            max_exams_per_day INTEGER DEFAULT 3,
+             allow_evening_exam INTEGER DEFAULT 1,
+            no_evening_exams BOOLEAN DEFAULT 0,
+            no_weekend_exams BOOLEAN DEFAULT 0,
+            unavailable_dates TEXT,
+            unavailable_times TEXT,
+            created_date TEXT DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(teacher_name)
         )
         ''')
 
@@ -142,11 +159,11 @@ class DatabaseManager:
         try:
             # 清空原有数据
             self.cursor.execute('DELETE FROM courses')
-            
+
             # 打印DataFrame的列名和前几行
             print("课程表列名:", exam_data.columns)
             print("课程表前5行:\n", exam_data.head())
-            
+
             # 插入课程数据
             for index, row in exam_data.iterrows():
                 try:
@@ -202,7 +219,7 @@ class DatabaseManager:
         try:
             # 清空原有教室数据
             self.cursor.execute('DELETE FROM exam_rooms')
-            
+
             # 插入教室数据
             for _, row in rooms_data.iterrows():
                 self.cursor.execute('''
@@ -254,7 +271,7 @@ class DatabaseManager:
             if not courses:
                 print("没有课程数据")
                 return False
-            
+
             if not rooms:
                 print("没有教室数据")
                 return False
@@ -266,7 +283,7 @@ class DatabaseManager:
             for course in courses:
                 # 选择合适的教室
                 suitable_room = self._find_suitable_room(course, rooms)
-                
+
                 if suitable_room:
                     # 插入考试安排
                     self.cursor.execute('''
@@ -282,15 +299,15 @@ class DatabaseManager:
                         学历层次
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ''', (
-                        course[0],   # 教室号
+                        course[0],  # 教室号
                         suitable_room[0],  # 教室编号
-                        course[3],   # 考试日期
-                        course[2],   # 考试时间
-                        course[7],   # 学院班级
-                        course[9],   # 考试人数
-                        course[5],   # 任课学院
-                        course[6],   # 专业
-                        course[4]    # 学历层次
+                        course[3],  # 考试日期
+                        course[2],  # 考试时间
+                        course[7],  # 学院班级
+                        course[9],  # 考试人数
+                        course[5],  # 任课学院
+                        course[6],  # 专业
+                        course[4]  # 学历层次
                     ))
 
             self.conn.commit()
@@ -311,7 +328,7 @@ class DatabaseManager:
             # 打印课程详细信息
             print("课程详细信息:", course)
             print("课程长度:", len(course))
-            
+
             # 尝试不同的索引获取考试人数
             for i in range(len(course)):
                 try:
@@ -319,7 +336,7 @@ class DatabaseManager:
                     print(f"尝试索引 {i}: 人数 = {students_count}")
                 except Exception as e:
                     print(f"索引 {i} 出错: {e}")
-            
+
             # 筛选符合条件的教室
             suitable_rooms = []
             for room in rooms:
@@ -349,7 +366,7 @@ class DatabaseManager:
     def export_current_exam_arrangements(self, export_path=None):
         """
         导出当前的考试安排到Excel
-        
+
         :param export_path: 导出路径，默认为用户桌面
         :return: 导出的文件路径
         """
@@ -373,12 +390,105 @@ class DatabaseManager:
                 JOIN courses c ON ea.教室号 = c.教室号
                 JOIN exam_rooms er ON ea.教室编号 = er.教室编号
             ''', self.conn)
-            
+
             # 导出到Excel
             df.to_excel(export_path, index=False)
             print(f"考试安排已导出到: {export_path}")
             return export_path
-        
+
         except Exception as e:
             print(f"导出考试安排出错: {e}")
-            return None 
+            return None
+
+    def get_teacher_constraints(self, teacher_name):
+        """
+        获取教师约束信息
+        """
+        try:
+            self.cursor.execute('''
+                SELECT max_exams_per_day, no_evening_exams, no_weekend_exams, 
+                       unavailable_dates, unavailable_times
+                FROM teacher_constraints 
+                WHERE teacher_name = ?
+            ''', (teacher_name,))
+            result = self.cursor.fetchone()
+
+            if result:
+                return {
+                    'max_exams_per_day': result[0],
+                    'no_evening_exams': bool(result[1]),
+                    'no_weekend_exams': bool(result[2]),
+                    'unavailable_dates': result[3].split(',') if result[3] else [],
+                    'unavailable_times': result[4].split(',') if result[4] else []
+                }
+            else:
+                # 返回默认约束
+                return {
+                    'max_exams_per_day': 3,
+                    'no_evening_exams': False,
+                    'no_weekend_exams': False,
+                    'unavailable_dates': [],
+                    'unavailable_times': []
+                }
+        except Exception as e:
+            print(f"获取教师约束失败: {e}")
+            return {
+                'max_exams_per_day': 3,
+                'no_evening_exams': False,
+                'no_weekend_exams': False,
+                'unavailable_dates': [],
+                'unavailable_times': []
+            }
+
+    def set_teacher_constraints(self, teacher_name, max_exams_per_day=3,
+                                no_evening_exams=False, no_weekend_exams=False,
+                                unavailable_dates=None, unavailable_times=None):
+        """
+        设置教师约束信息
+        """
+        try:
+            unavailable_dates_str = ','.join(unavailable_dates) if unavailable_dates else ''
+            unavailable_times_str = ','.join(unavailable_times) if unavailable_times else ''
+
+            self.cursor.execute('''
+                INSERT OR REPLACE INTO teacher_constraints 
+                (teacher_name, max_exams_per_day, no_evening_exams, no_weekend_exams, 
+                 unavailable_dates, unavailable_times)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (teacher_name, max_exams_per_day, no_evening_exams, no_weekend_exams,
+                  unavailable_dates_str, unavailable_times_str))
+
+            self.conn.commit()
+            return True
+        except Exception as e:
+            print(f"设置教师约束失败: {e}")
+            return False
+
+    def get_exam_arrangements_with_building(self):
+        """
+        获取包含教学楼信息的考试安排
+        """
+        try:
+            query = '''
+                SELECT 
+                    c.课程名称, 
+                    c.学院班级, 
+                    c.教师, 
+                    ea.考试日期, 
+                    ea.考试时间, 
+                    er.教室编号,
+                    er.教室名称,
+                    er.教学楼,
+                    ea.考试人数,
+                    ea.arrangement_id
+                FROM exam_arrangements ea
+                JOIN courses c ON ea.教室号 = c.id
+                JOIN exam_rooms er ON ea.教室编号 = er.教室编号
+                ORDER BY ea.考试日期, ea.考试时间
+            '''
+
+            self.cursor.execute(query)
+            return self.cursor.fetchall()
+        except Exception as e:
+            print(f"获取考试安排失败: {e}")
+            return [] 
